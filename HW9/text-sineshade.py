@@ -1,0 +1,130 @@
+import cv2
+import numpy as np
+import pytesseract
+
+
+def preprocess_text_sineshade(img_gray, ksize=101):
+    """
+    對 text-sineshade.tif 做前處理：
+    1. 以大尺寸高斯模糊估計背景 (sine shade)
+    2. 以除法方式做光照補償，減少條紋陰影
+    3. Otsu 二值化，得到黑白文字影像
+    回傳：
+        corrected  : 補償後的灰階影像
+        bw         : 二值影像
+    """
+    # 轉成 float，避免除法時溢位，並加 1 避免除以 0
+    img_f = img_gray.astype(np.float32) + 1.0
+
+    # 大 kernel 高斯模糊估計背景 (只保留緩慢變化的 sine shade)
+    bg = cv2.GaussianBlur(img_f, (ksize, ksize), 0) + 1.0
+
+    # 光照補償：除以背景，讓背景變得較平均
+    corrected = (img_f / bg) * 128.0
+    corrected = np.clip(corrected, 0, 255).astype(np.uint8)
+
+    # Otsu 二值化
+    _, bw = cv2.threshold(corrected, 0, 255,
+                          cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    return corrected, bw
+
+
+def ocr_from_binary(bw):
+    """
+    使用二值影像做 OCR：
+    1. 統一成黑字白底（Tesseract 比較習慣）
+    2. 放大 2 倍
+    3. 呼叫 Tesseract
+    """
+    # 判斷目前是白底黑字還是黑底白字
+    num_white = np.sum(bw == 255)
+    num_black = bw.size - num_white
+
+    # 我們要「黑字白底」給 OCR
+    if num_white >= num_black:
+        img_ocr = bw.copy()         # 背景是白，字是黑 → OK
+    else:
+        img_ocr = 255 - bw          # 反相
+
+    # 放大 2 倍
+    img_ocr = cv2.resize(
+        img_ocr, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_LINEAR
+    )
+
+    # Tesseract 參數：--psm 6 適合一般文字段落
+    config = "--psm 6"
+    text = pytesseract.image_to_string(img_ocr, config=config)
+
+    return text, img_ocr
+
+
+def clean_ocr_text(text: str) -> str:
+    """
+    整理 Tesseract 的輸出：
+    - 去掉 form feed (\x0c)
+    - 去掉開頭/結尾空白行
+    - 移除「前後都有文字、自己卻是空白」的孤立空白行
+    """
+    # 去掉控制字元
+    text = text.replace('\x0c', '')
+
+    # 切成行
+    lines = text.splitlines()
+
+    # 去掉開頭/結尾空白行
+    while lines and lines[0].strip() == '':
+        lines.pop(0)
+    while lines and lines[-1].strip() == '':
+        lines.pop()
+
+    # 移除中間的孤立空白行
+    cleaned_lines = []
+    for i, ln in enumerate(lines):
+        if ln.strip() != '':
+            cleaned_lines.append(ln)
+        else:
+            prev_has_text = (i > 0 and lines[i - 1].strip() != '')
+            next_has_text = (i < len(lines) - 1 and lines[i + 1].strip() != '')
+            # 前後都有文字 → 視為多出來的空白行，丟掉
+            if prev_has_text and next_has_text:
+                continue
+            cleaned_lines.append(ln)
+
+    # 組回字串，最後補一個換行
+    return '\n'.join(cleaned_lines) + '\n'
+
+
+def main():
+    # 讀入 text-sineshade.tif（灰階）
+    img_gray = cv2.imread("text-sineshade.tif", cv2.IMREAD_GRAYSCALE)
+    if img_gray is None:
+        raise FileNotFoundError("找不到 text-sineshade.tif，請確認檔案是否在同一資料夾。")
+
+    # 1. 去除 sine shade（背景補償 + 二值化）
+    corrected, bw = preprocess_text_sineshade(img_gray, ksize=101)
+
+    # 儲存「清除 sine shade 後」的影像（報告可用）
+    cv2.imwrite("text-sineshade_corrected.png", corrected)
+    cv2.imwrite("text-sineshade_binary.png", bw)
+
+    # 2. OCR 辨識
+    raw_text, img_ocr = ocr_from_binary(bw)
+
+    # 儲存餵給 Tesseract 的影像（黑字白底、放大後）
+    cv2.imwrite("text-sineshade_ocr_input.png", img_ocr)
+
+    # 3. 整理文字，避免多出原圖沒有的空行
+    final_text = clean_ocr_text(raw_text)
+
+    # 4. 寫入文字檔（作業規定檔名）
+    with open("text-sineshade.txt", "w", encoding="utf-8") as f:
+        f.write(final_text)
+
+    print("text-sineshade.tif 辨識完成，結果已寫入 text-sineshade.txt")
+    print("==== OCR 輸出預覽 ====")
+    print('\n'.join(final_text.splitlines()[:10]))
+
+
+if __name__ == "__main__":
+    main()
